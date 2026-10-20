@@ -335,6 +335,57 @@ def _decode_failure(stderr: str) -> ASRError:
     return ASRError("ffmpeg could not decode the authorized media stream")
 
 
+def _emit_media_decode_probe_telemetry(source_ref: str) -> None:
+    """DIAG34970-1 P1（2026-10-20）：解码失败路径的 ffprobe 流清单闭集遥测。
+
+    34970 三讲定谳残余（无音轨 S1 / 音轨不可解 S2 / 深损 S3）共享同一个
+    兜底 media_decode_failed 形状，一条流清单证据即可闭合。仅本地容器路径
+    探测（URL 一律跳过——观测绝不发起网络外呼）；字段闭集=流数与
+    ``codec_type:codec_name`` 枚举（闭集外类型归 unknown，名只留字母数字），
+    零 URL/零内容/零字节数，与既有 stage= 遥测同安全面。行为零改动：本
+    helper 只观测不抛（探测自身失败也按闭集形状如实上报），调用点随后原样
+    走既有 ``_decode_failure`` 分类，拒绝语义一字不变。
+    """
+    try:
+        container = Path(source_ref)
+        if not container.is_file():
+            return
+        returncode, stdout, _ = _run_bounded_process(
+            [
+                "ffprobe", "-v", "error", "-show_entries",
+                "stream=index,codec_type,codec_name", "-of", "csv=p=0",
+                str(container),
+            ],
+            timeout=30,
+            capture_stdout=True,
+        )
+    except Exception:
+        _emit_telemetry("stage=media-decode-probe probe=failed")
+        return
+    if returncode != 0:
+        _emit_telemetry("stage=media-decode-probe probe=failed")
+        return
+    known_types = frozenset({"audio", "video", "subtitle", "data", "attachment"})
+    streams: list[str] = []
+    total = 0
+    for line in stdout.decode("utf-8", errors="replace").splitlines()[:32]:
+        fields = [item.strip() for item in line.split(",")]
+        if len(fields) < 2:
+            continue
+        total += 1
+        if len(streams) >= 8:
+            continue
+        codec_type = fields[1] if fields[1] in known_types else "unknown"
+        codec_name = re.sub(r"[^a-z0-9_]", "", fields[2].casefold() if len(fields) > 2 else "")[:24]
+        streams.append(f"{codec_type}:{codec_name or 'unknown'}")
+    if not streams:
+        _emit_telemetry("stage=media-decode-probe streams=0 codecs=none")
+        return
+    _emit_telemetry(
+        f"stage=media-decode-probe streams={total} codecs={','.join(streams)}"
+    )
+
+
 def _media_response_error(profile: MediaResponseProfile) -> ASRError | None:
     http_messages = {
         "http_401": "authorized media request returned HTTP 401",
@@ -978,6 +1029,9 @@ def _decode_media_to_pcm(
         target.unlink(missing_ok=True)
         raise ASRError("authorized media upstream connection failed")
     if returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+        # DIAG34970-1 P1：失败定谳观测先行（本地容器才探，URL 静默跳过），
+        # 随后分类与拒绝语义零变化。
+        _emit_media_decode_probe_telemetry(source_ref)
         target.unlink(missing_ok=True)
         raise _decode_failure(ffmpeg_stderr.decode("utf-8", errors="replace"))
     # 完整性门（MEDIA-FIX-PREFETCH-1）：ffmpeg 对提前 EOF exit 0，期望字节
@@ -1337,6 +1391,8 @@ def _decode_chunk_from_url(
         target.unlink(missing_ok=True)
         raise ASRError("authorized media upstream connection failed")
     if returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+        # DIAG34970-1 P1：同面覆盖（分块源恒为 URL，is_file 守卫使其自然零操作）。
+        _emit_media_decode_probe_telemetry(media_url)
         target.unlink(missing_ok=True)
         raise _decode_failure(ffmpeg_stderr.decode("utf-8", errors="replace"))
 
