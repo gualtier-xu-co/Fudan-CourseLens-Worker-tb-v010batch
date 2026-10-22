@@ -25,6 +25,19 @@ confidence 语义（两载体同一纪律，期 2 消费勿混淆）：
 
 坏形状降级纪律（LEARN-D2 §5 风险 2）：doc/chapters_v2 任何形状不合=不产
 字段→前端走旧态诚实呈现，绝不渲染半残文档。全部纯函数，零 I/O 零网络。
+
+V010-CONTENT-IMPL-1（CONTENT-R1 兑现道，2026-10-22）三期 1 增量：
+1. 章节数量纪律 ``enforce_chapter_count``（CONTENT-R1 实测 44 例 chapters
+   0-59 失控）：按讲次时长比例区间帽（≥3 地板、20 帽=同族产品实证常数），
+   超限按时间近邻合并（最小 start 间隙、并列取最左），≤帽原样透传（幂等）。
+2. 边界感知贪心（CONTENT-R1 C1）：build_chapters_v2 的 5 分钟定时闭合改为
+   ±2 分钟浮动窗内「文本重合度最低点」闭合——字符二元组 Dice 相似度
+   （零新模型零新 LLM 调用），仍守 3 分钟地板/20 分钟帽/首块 0:00；
+   浮动窗内无候选（稀疏转写大间隙）=回退旧定时贪心；并列取离目标最近。
+3. LLM 结构化 doc 增量 ``coerce_llm_doc``（期 0 预留的「期 1 LLM 结构化
+   输出」）：合并链 doc 候选逐点锚白名单收敛+逐段清洗后过
+   validate_summary_doc 同一道门；逐级丢弃（点→段→整文档），全不可用=
+   None（调用方走本地 build_summary_doc 兜底），落键形状恒过门=禁半残。
 """
 
 from __future__ import annotations
@@ -42,6 +55,13 @@ EVENT_SOURCES = ("transcription", "manual")
 _BLOCK_FLOOR_MS = 180_000   # 3 分钟地板（硬门：任一块不足=降级省键）
 _BLOCK_TARGET_MS = 300_000  # 5 分钟切片目标（贪心闭合阈值）
 _BLOCK_CAP_MS = 1_200_000   # 20 分钟目标帽（软目标超限提前闭合，不硬门）
+# V010-CONTENT-IMPL-1（CONTENT-R1 C1 边界感知贪心）：浮动窗=目标时刻 ±2 分钟，
+# 窗内取文本重合度最低点闭合（零新调用）；窗下界恰为 3 分钟地板（切点永不
+# 破地板），上界钳在 20 分钟帽内（浮动延伸不吃帽）。
+_BLOCK_FLOAT_MS = 120_000
+# 章节数量纪律（CONTENT-R1 B2 实证 0-59 失控）：帽=时长//地板与常数帽取小。
+_CHAPTER_COUNT_CAP = 20
+_CHAPTER_MERGED_SUMMARY_CAP = 500
 _DOC_MIN_SECTIONS = 3       # ≥3 块硬门
 _MAX_BLOCKS = 500
 
@@ -248,6 +268,60 @@ def validate_chapters_v2(value: Any) -> dict[str, Any] | None:
     return {"aggregation": aggregation, "items": items}
 
 
+# ---- 章节边界感知贪心（V010-CONTENT-IMPL-1，CONTENT-R1 C1）-----------------
+
+
+def _char_bigrams(text: str) -> set[str]:
+    cleaned = "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+    return {cleaned[index:index + 2] for index in range(len(cleaned) - 1)}
+
+
+def _dice_similarity(left: str, right: str) -> float:
+    left_grams = _char_bigrams(left)
+    right_grams = _char_bigrams(right)
+    if not left_grams or not right_grams:
+        return 0.0
+    return 2.0 * len(left_grams & right_grams) / (len(left_grams) + len(right_grams))
+
+
+def _boundary_similarity(segments: list[tuple[int, int, str]], index: int) -> float:
+    """候选切点的相邻文本重合度：切点前最多 2 段 vs 切点起最多 2 段（各截
+    200 字）。最低=话题边界最强；与 llm._takeaway_anchor_ms 同族字符二元组
+    Dice（本模块零依赖 llm，独立同式实现）。"""
+    before = "".join(part[2] for part in segments[max(0, index - 2):index])[-200:]
+    after = "".join(part[2] for part in segments[index:index + 2])[:200]
+    return _dice_similarity(before, after)
+
+
+def _find_block_boundary(
+    segments: list[tuple[int, int, str]], index: int, block_start: int,
+) -> int | None:
+    """下一块起点=浮动窗 [目标−2min, min(目标+2min, 20 分钟帽)] 内文本重合度
+    最低的段起点（并列取离目标最近、再取最早）；窗内无候选（稀疏转写大间隙）
+    =回退旧定时贪心（首个 ≥ 目标的段起点）；无更多段=None（尾块）。"""
+    total = len(segments)
+    target = block_start + _BLOCK_TARGET_MS
+    low = target - _BLOCK_FLOAT_MS
+    high = min(target + _BLOCK_FLOAT_MS, block_start + _BLOCK_CAP_MS)
+    candidates = [
+        position for position in range(index + 1, total)
+        if low <= segments[position][0] <= high
+    ]
+    if candidates:
+        return min(
+            candidates,
+            key=lambda position: (
+                _boundary_similarity(segments, position),
+                abs(segments[position][0] - target),
+                segments[position][0],
+            ),
+        )
+    for position in range(index + 1, total):
+        if segments[position][0] >= target:
+            return position
+    return None
+
+
 # ---- 期 0 semantic_fallback 构建器（确定性本地切片，零 LLM 调用）-----------
 
 
@@ -264,10 +338,12 @@ def _block_title(chapters: list[dict[str, Any]], block_text: str) -> tuple[str, 
 def build_chapters_v2(
     chapters: list[dict[str, Any]], transcript: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """期 0 semantic_fallback 板块切片：按转写段时间轴贪心切 5 分钟目标块，
-    LLM 章节名/摘要按时间落入对应块（幻灯片标题优先、转写短语兜底）；尾块
-    不足地板并入前块；随后过 validate_chapters_v2 硬门，不合= None（前端走
-    旧 chapters）。转写缺席（纯课件讲次）=None（诚实省键，不虚构板块）。"""
+    """期 0 semantic_fallback 板块切片：转写段时间轴边界感知贪心（CONTENT-R1
+    C1：5 分钟目标 ±2 分钟浮动窗内取文本重合度最低点闭合，零 LLM 调用；稀疏
+    转写回退定时贪心），LLM 章节名/摘要按时间落入对应块（幻灯片标题优先、
+    转写短语兜底）；尾块不足地板并入前块；随后过 validate_chapters_v2 硬门，
+    不合= None（前端走旧 chapters）。转写缺席（纯课件讲次）=None（诚实省键，
+    不虚构板块）。"""
     segments: list[tuple[int, int, str]] = []
     for item in transcript or []:
         if not isinstance(item, dict):
@@ -289,17 +365,16 @@ def build_chapters_v2(
         key=lambda item: int(item.get("start_ms") or 0),
     )
     blocks: list[tuple[int, list[tuple[int, int, str]]]] = []
-    current_start = 0  # 首块 0:00（板块铺满时间轴，闭集首块定义）
-    pending: list[tuple[int, int, str]] = []
-    for trio in segments:
-        # 5 分钟目标贪心闭合（20 分钟帽为软目标，由目标阈值自然吸收）。
-        if pending and trio[0] - current_start >= _BLOCK_TARGET_MS:
-            blocks.append((current_start, pending))
-            current_start = trio[0]
-            pending = []
-        pending.append(trio)
-    if pending:
-        blocks.append((current_start, pending))
+    block_start = 0  # 首块 0:00（板块铺满时间轴，闭集首块定义）
+    index = 0
+    while index < len(segments):
+        boundary = _find_block_boundary(segments, index, block_start)
+        if boundary is None:
+            blocks.append((block_start, segments[index:]))
+            break
+        blocks.append((block_start, segments[index:boundary]))
+        block_start = segments[boundary][0]
+        index = boundary
     # 尾块不足地板=并入前块（回翻不成块纪律的对偶：宁少一块不立碎块）。
     if len(blocks) >= 2:
         last_start, last_parts = blocks[-1]
@@ -330,6 +405,132 @@ def build_chapters_v2(
             "source": "semantic",
         })
     return validate_chapters_v2({"aggregation": "semantic_fallback", "items": items})
+
+
+# ---- 章节数量纪律（V010-CONTENT-IMPL-1，CONTENT-R1 B2）---------------------
+
+
+def enforce_chapter_count(
+    chapters: list[dict[str, Any]], duration_ms: int,
+) -> list[dict[str, Any]]:
+    """LLM 合并链章节数量纪律：区间帽=max(≥3 地板, min(时长//3 分钟地板, 20))。
+    实测 44 例 0-59 失控（与质量无关，最大产物 0 章节）——超帽=反复「时间最
+    近邻合并」（最小 start 间隙对，并列取最左）直至 ≤ 帽；≤帽按 start_ms 稳
+    定排序原样透传（键集零变化，幂等）。纯本地确定性规则，零新调用；章节数
+    据不删字（合并摘要拼接截帽），锚取合并对首项（白名单值不丢形）。"""
+    items = [item for item in (chapters or []) if isinstance(item, dict)]
+    if not items:
+        return []
+    items.sort(key=lambda item: int(item.get("start_ms") or 0))
+    duration = max(0, int(duration_ms or 0))
+    cap = max(_DOC_MIN_SECTIONS, min(duration // _BLOCK_FLOOR_MS, _CHAPTER_COUNT_CAP))
+    merged = list(items)
+    while len(merged) > cap:
+        best_index = 0
+        best_gap: int | None = None
+        for position in range(len(merged) - 1):
+            gap = (
+                int(merged[position + 1].get("start_ms") or 0)
+                - int(merged[position].get("start_ms") or 0)
+            )
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best_index = position
+        first, second = merged[best_index], merged[best_index + 1]
+        merged[best_index] = {
+            "title": _clean_text(first.get("title"), _TITLE_CAP),
+            "start_ms": int(first.get("start_ms") or 0),
+            "summary": (
+                _clean_text(first.get("summary"), 2_000).strip()
+                + "；"
+                + _clean_text(second.get("summary"), 2_000).strip()
+            )[:_CHAPTER_MERGED_SUMMARY_CAP],
+        }
+        del merged[best_index + 1]
+    return merged
+
+
+# ---- 期 1 LLM 结构化 doc 增量（V010-CONTENT-IMPL-1；走同一校验门）----------
+
+
+def coerce_llm_doc(raw: Any, valid_anchors: set[int]) -> dict[str, Any] | None:
+    """合并链 LLM doc 候选收敛器：逐级清洗后过 validate_summary_doc 同一道门
+    （期 0 docstring 预留的「期 1 LLM 结构化输出」兑现）。清洗规则：
+    - 锚完整性：sections 的 start_ms/points 的 anchor_ms 必须在转写/课件锚
+      白名单内（QSCOREFIX-1④ 同纪律：白名单外=不可跳转=宁丢不编）；
+    - source 收敛：合并链候选语义恒为 ``semantic``（ provenance 是调用方已知
+      事实，不信任 LLM 自报）；
+    - 逐级丢弃：坏点丢点、空段丢段、全空= None（调用方回退本地
+      build_summary_doc 组装）；落键形状恒过 validate_summary_doc=禁半残。"""
+    if not isinstance(raw, dict) or not isinstance(valid_anchors, set):
+        return None
+    raw_sections = raw.get("sections")
+    if not isinstance(raw_sections, list):
+        return None
+    sections: list[dict[str, Any]] = []
+    for item in raw_sections[:_MAX_BLOCKS]:
+        if not isinstance(item, dict):
+            continue
+        start_ms = _valid_ms(item.get("start_ms"))
+        title = _clean_text(item.get("title"), _TITLE_CAP)
+        if start_ms is None or start_ms not in valid_anchors or not title:
+            continue
+        raw_points = item.get("points")
+        if not isinstance(raw_points, list):
+            continue
+        points: list[dict[str, Any]] = []
+        for point in raw_points[:16]:
+            if not isinstance(point, dict):
+                continue
+            text = _clean_text(point.get("text"), _POINT_CAP)
+            anchor = _valid_ms(point.get("anchor_ms"))
+            if not text or anchor is None or anchor not in valid_anchors:
+                continue
+            points.append({"text": text, "anchor_ms": anchor})
+        if not points:
+            continue
+        formulas: list[dict[str, Any]] = []
+        raw_formulas = item.get("formulas")
+        if isinstance(raw_formulas, list):
+            for formula in raw_formulas[:16]:
+                if not isinstance(formula, dict):
+                    continue
+                latex = _clean_text(formula.get("latex"), 300)
+                if not latex:
+                    continue
+                entry: dict[str, Any] = {"latex": latex}
+                anchor = _valid_ms(formula.get("anchor_ms"))
+                if anchor is not None and anchor in valid_anchors:
+                    entry["anchor_ms"] = anchor
+                caption = _clean_text(formula.get("caption"), 200)
+                if caption:
+                    entry["caption"] = caption
+                formulas.append(entry)
+        section: dict[str, Any] = {
+            "start_ms": start_ms,
+            "title": title,
+            "source": "semantic",
+            "points": points,
+            "formulas": formulas,
+        }
+        raw_example = item.get("example")
+        if isinstance(raw_example, dict):
+            example_text = _clean_text(raw_example.get("text"), _POINT_CAP)
+            if example_text:
+                example: dict[str, Any] = {"text": example_text}
+                anchor = _valid_ms(raw_example.get("anchor_ms"))
+                if anchor is not None and anchor in valid_anchors:
+                    example["anchor_ms"] = anchor
+                section["example"] = example
+        sections.append(section)
+    if not sections:
+        return None
+    return validate_summary_doc({
+        "overview": raw.get("overview") if raw.get("overview") is not None else "",
+        "sections": sections,
+        "terms": raw.get("terms") if raw.get("terms") is not None else [],
+        "summary_notes": raw.get("summary_notes") if raw.get("summary_notes") is not None else [],
+    })
 
 
 # ---- doc 本地构建（期 0：零新调用，从已过门的结构化产物忠实组装）-----------

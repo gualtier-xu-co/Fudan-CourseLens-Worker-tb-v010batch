@@ -23,6 +23,8 @@ from courselens_worker.summary_contract import (
     annotate_assessment_events,
     build_chapters_v2,
     build_summary_doc,
+    coerce_llm_doc,
+    enforce_chapter_count,
     validate_chapters_v2,
     validate_summary_doc,
 )
@@ -209,6 +211,179 @@ class TestChaptersV2ClosedSet:
         assert build_summary_doc("", chapters_v2, ["结一"]) is None
 
 
+class TestChaptersBoundaryGreedy:
+    """V010-CONTENT-IMPL-1 件4（CONTENT-R1 C1）：±2 分钟浮动窗内文本重合度
+    最低点闭合——零新 LLM 调用的边界感知贪心。"""
+
+    @staticmethod
+    def _transcript(minutes: int, topic_words: callable) -> list[dict]:
+        return [
+            {"start_ms": index * 60_000, "end_ms": (index + 1) * 60_000,
+             "text": topic_words(index) + "。"}
+            for index in range(minutes)
+        ]
+
+    def test_topic_shift_boundary_lands_at_lowest_similarity_point(self):
+        # 0-5 分钟词汇族 A、6 分钟起词汇族 B：目标 5 分钟的 ±2min 浮动窗内，
+        # 6 分钟切点的「前后文本重合度」最低 → 边界落在 6:00 而非 5:00。
+        vocabulary = (
+            lambda index: "力加速度牛顿质量惯性摩擦" * 8
+            if index < 6 else "电压电流电阻欧姆电路功率" * 8
+        )
+        value = build_chapters_v2([], self._transcript(20, vocabulary))
+        assert value is not None
+        starts = [item["start_ms"] for item in value["items"]]
+        assert starts[1] == 360_000  # 话题断点=6 分钟（浮动窗内重合度最低点）
+        # 地板/单调闭集照守。
+        spans = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
+        assert all(span >= 180_000 for span in spans)
+        assert all(later > earlier for earlier, later in zip(starts, starts[1:]))
+
+    def test_uniform_text_ties_resolve_to_target_mark(self):
+        # 均质文本（无重合度低谷）=并列取离目标最近 → 恒在 5 分钟整（期 0
+        # 旧行为成为并列特例，确定性回归钉）。
+        transcript = self._transcript(
+            45, lambda index: f"第{index}分钟转写句。"
+        )
+        value = build_chapters_v2([], transcript)
+        assert value is not None
+        assert [item["start_ms"] for item in value["items"]] == [
+            index * 300_000 for index in range(9)
+        ]
+
+    def test_sparse_transcript_falls_back_to_timed_greedy(self):
+        # 稀疏转写（10 分钟大间隙）：浮动窗内无候选段起点 → 回退旧定时贪心
+        # （首个 ≥ 目标的段起点），块边界=真实段起点（不虚构窗内时刻）。
+        transcript = [
+            {"start_ms": index * 600_000, "end_ms": (index + 1) * 600_000,
+             "text": f"稀疏段{index}的内容。"}
+            for index in range(5)
+        ]
+        value = build_chapters_v2([], transcript)
+        assert value is not None
+        assert [item["start_ms"] for item in value["items"]] == [
+            index * 600_000 for index in range(5)
+        ]
+
+    def test_boundary_greedy_is_deterministic(self):
+        transcript = self._transcript(
+            30, lambda index: f"确定性内容{index % 7}交替出现。"
+        )
+        first = build_chapters_v2([], transcript)
+        second = build_chapters_v2([], transcript)
+        assert first == second  # 纯函数同输入同输出（零随机性）
+
+
+class TestChapterCountDiscipline:
+    """V010-CONTENT-IMPL-1 件3（CONTENT-R1 B2）：章节数量纪律（区间帽）。"""
+
+    def test_over_cap_merges_to_duration_proportional_cap(self):
+        # 59 章（实测失控形态）/45 分钟讲次 → 帽=2700s//180s=15。
+        chapters = [
+            {"title": f"碎章{index}", "start_ms": index * 45_000,
+             "summary": f"摘要{index}"}
+            for index in range(59)
+        ]
+        merged = enforce_chapter_count(chapters, 45 * 60_000)
+        assert len(merged) == 15
+        starts = [item["start_ms"] for item in merged]
+        assert starts == sorted(starts)  # 按时间有序
+        assert len(set(starts)) == len(starts)  # 合并对消零间隙重复
+        # 合并不删字：首章标题保留（合并对取先者）。
+        assert merged[0]["title"] == "碎章0"
+
+    def test_under_cap_passthrough_is_sorted_and_value_identical(self):
+        chapters = [
+            {"title": "乙", "start_ms": 600_000, "summary": "后"},
+            {"title": "甲", "start_ms": 0, "summary": "前"},
+        ]
+        result = enforce_chapter_count(chapters, 45 * 60_000)
+        assert [item["title"] for item in result] == ["甲", "乙"]
+        assert result[0] == {"title": "甲", "start_ms": 0, "summary": "前"}
+        # 输入不回写（纯函数）。
+        assert chapters[0]["title"] == "乙"
+
+    def test_short_lecture_floor_cap(self):
+        # 短讲次（2 分钟）：帽=max(≥3 地板, min(120s//180s=0, 20))=3。
+        chapters = [
+            {"title": f"章{index}", "start_ms": index * 20_000,
+             "summary": "s"} for index in range(5)
+        ]
+        assert len(enforce_chapter_count(chapters, 2 * 60_000)) == 3
+
+    def test_discipline_output_is_idempotent(self):
+        chapters = [
+            {"title": f"碎章{index}", "start_ms": index * 30_000,
+             "summary": f"摘要{index}"}
+            for index in range(40)
+        ]
+        once = enforce_chapter_count(chapters, 45 * 60_000)
+        twice = enforce_chapter_count(once, 45 * 60_000)
+        assert once == twice
+
+
+class TestCoerceLlmDoc:
+    """V010-CONTENT-IMPL-1 件3（期 1 LLM 结构化增量）：doc 候选走同一道门。"""
+
+    _ANCHORS = {0, 300_000, 600_000}
+
+    @staticmethod
+    def _doc() -> dict:
+        return {
+            "overview": ["总述一", "总述二"],
+            "sections": [
+                {
+                    "start_ms": 0,
+                    "title": "板块",
+                    "source": "semantic",
+                    "points": [{"text": "要点", "anchor_ms": 0}],
+                    "formulas": [{"latex": "E=mc^2", "anchor_ms": 300_000,
+                                  "caption": "质能关系"}],
+                },
+                {
+                    "start_ms": 600_000,
+                    "title": "板块二",
+                    "source": "youtube",  # 非法自报 → 收敛为 semantic
+                    "points": [{"text": "要点二", "anchor_ms": 600_000}],
+                    "formulas": [],
+                },
+            ],
+            "summary_notes": ["小结"],
+        }
+
+    def test_valid_candidate_passes_same_gate_with_source_coerced(self):
+        doc = coerce_llm_doc(self._doc(), self._ANCHORS)
+        assert doc is not None
+        assert doc == validate_summary_doc(doc)  # 落键形状恒过门
+        assert all(item["source"] == "semantic" for item in doc["sections"])
+        assert doc["sections"][0]["formulas"][0]["latex"] == "E=mc^2"
+
+    def test_off_whitelist_anchors_prune_points_and_sections(self):
+        candidate = self._doc()
+        candidate["sections"][0]["points"][0]["anchor_ms"] = 999_999
+        doc = coerce_llm_doc(candidate, self._ANCHORS)
+        # 第一段点全被剪→段丢弃；只剩第二段（合法锚）——逐级丢弃不整档报废。
+        assert doc is not None
+        assert [item["title"] for item in doc["sections"]] == ["板块二"]
+
+    def test_all_pruned_or_malformed_returns_none(self):
+        assert coerce_llm_doc({"sections": []}, self._ANCHORS) is None
+        assert coerce_llm_doc({"sections": "junk"}, self._ANCHORS) is None
+        assert coerce_llm_doc("doc", self._ANCHORS) is None
+        assert coerce_llm_doc(None, self._ANCHORS) is None
+        # 全部段锚白名单外=全剪→None（调用方走本地组装兜底）。
+        candidate = self._doc()
+        for section in candidate["sections"]:
+            section["start_ms"] = 42_000
+        assert coerce_llm_doc(candidate, self._ANCHORS) is None
+
+    def test_missing_overview_fails_gate(self):
+        # overview 缺席=校验器拒（门不接受半残文档）→ None → 本地兜底。
+        candidate = self._doc()
+        del candidate["overview"]
+        assert coerce_llm_doc(candidate, self._ANCHORS) is None
+
+
 class TestEventsAdditive:
     def test_annotate_is_purely_additive(self):
         events = [{
@@ -322,3 +497,90 @@ class TestCreateSummaryV3Integration:
         assert value["schema_ver"] == 3
         assert "doc" not in value
         assert "chapters_v2" not in value
+
+    def test_llm_structured_doc_wins_and_chapters_capped_in_chain(self):
+        """V010-CONTENT-IMPL-1 件3 全链：合并调用带合法 doc 候选=LLM 结构化
+        doc 落键（本地组装让位）；超帽数量章节经纪律合并后落 chapters。"""
+        transcript = [
+            {"start_ms": index * 60_000, "end_ms": (index + 1) * 60_000,
+             "text": f"合成转写第{index}分钟。"}
+            for index in range(45)
+        ]
+        window = {
+            "markdown": "窗口笔记",
+            "chapters": [{"title": "开场", "start_ms": 0, "summary": "s"}],
+        }
+        llm_doc = {
+            "overview": ["LLM 总述段"],
+            "sections": [{
+                "start_ms": 0,
+                "title": "LLM 板块",
+                "source": "semantic",
+                "points": [{"text": "锚定要点", "anchor_ms": 0}],
+                "formulas": [{"latex": "V=IR", "anchor_ms": 60_000,
+                              "caption": "欧姆定律"}],
+            }],
+            "summary_notes": ["小结一", "小结二", "小结三"],
+        }
+        merge_payload = {
+            "markdown": "# 合成笔记\n\n第一段概述。",
+            # 45 分钟讲次帽=15：25 章失控发射→纪律合并。
+            "chapters": [
+                {"title": f"碎章{index}", "start_ms": index * 60_000,
+                 "summary": f"摘要{index}"}
+                for index in range(25)
+            ],
+            "key_takeaways": ["结论一", "结论二", "结论三"],
+            "assessment_events": [],
+            "doc": llm_doc,
+        }
+
+        def _routed_chat(api_key, messages, **kwargs):
+            is_merge = "assessment_events" in messages[0]["content"]
+            return json.dumps(merge_payload if is_merge else window)
+
+        with patch("courselens_worker.llm._chat", _routed_chat):
+            value = create_summary(
+                "key", title="合成讲", transcript=transcript, ppt_pages=[],
+            )
+        # 章节数量纪律：25 → 15（时长比例帽），有序。
+        assert len(value["chapters"]) == 15
+        starts = [item["start_ms"] for item in value["chapters"]]
+        assert starts == sorted(starts)
+        # LLM 结构化 doc 落键（overview=LLM 总述，非本地 markdown 段）。
+        assert value["doc"]["overview"] == ["LLM 总述段"]
+        assert value["doc"]["sections"][0]["title"] == "LLM 板块"
+        assert value["doc"]["sections"][0]["formulas"][0]["latex"] == "V=IR"
+        # 落键形状恒过同一道门。
+        assert validate_summary_doc(value["doc"]) == value["doc"]
+
+    def test_malformed_llm_doc_falls_back_to_local_build(self):
+        """坏形状 doc=逐级丢弃→全不可用→本地组装兜底（fail-closed 禁半残）。"""
+        transcript = [
+            {"start_ms": index * 60_000, "end_ms": (index + 1) * 60_000,
+             "text": f"合成转写第{index}分钟。"}
+            for index in range(45)
+        ]
+        window = {
+            "markdown": "窗口笔记",
+            "chapters": [{"title": "开场", "start_ms": 0, "summary": "s"}],
+        }
+        merge_payload = {
+            "markdown": "# 合成笔记\n\n第一段概述。",
+            "chapters": [{"title": "开场", "start_ms": 0, "summary": "开场摘要"}],
+            "key_takeaways": ["结论一", "结论二", "结论三"],
+            "assessment_events": [],
+            "doc": {"sections": "junk"},  # 坏形状候选
+        }
+
+        def _routed_chat(api_key, messages, **kwargs):
+            is_merge = "assessment_events" in messages[0]["content"]
+            return json.dumps(merge_payload if is_merge else window)
+
+        with patch("courselens_worker.llm._chat", _routed_chat):
+            value = create_summary(
+                "key", title="合成讲", transcript=transcript, ppt_pages=[],
+            )
+        # doc=本地组装兜底（overview=笔记开头段落），仍过门。
+        assert value["doc"]["overview"][0] == "合成笔记"
+        assert validate_summary_doc(value["doc"]) == value["doc"]

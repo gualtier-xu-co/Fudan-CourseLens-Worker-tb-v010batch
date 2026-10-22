@@ -23,6 +23,8 @@ from .summary_contract import (
     annotate_assessment_events,
     build_chapters_v2,
     build_summary_doc,
+    coerce_llm_doc,
+    enforce_chapter_count,
 )
 from .course_knowledge import (
     coverage_summary,
@@ -1497,6 +1499,7 @@ _SUMMARY_EVIDENCE_WINDOW_PROMPT = (
 _WINDOW_TEACHING_SUFFIX = (
     "笔记须保留机制与推导链（每步为何成立）；幻灯/图像内容按能带/电路/波形/"
     "结构/流程归类记事实（坐标/单位/区域/方向），只记输入内事实。"
+    "公式一律用 LaTeX 记写：行内 \\(…\\)、独立 \\[…\\]，禁用单个 $ 包裹。"
 )
 _STEM_TEACHING_RULES = (
     "先判定本讲是否推导型理工内容（公式推导/器件/电路类）：依据 title、"
@@ -1509,10 +1512,31 @@ _STEM_TEACHING_RULES = (
     "电极再讲工作机制；流程图读起止与分支再讲输入输出），未出现的类型不写；"
     "无图像材料时四段「问题与位置/机制与递进推导/适用条件与反例/实例」。"
     "只重排已有素材，不增材料外事实。"
+    # V010-CONTENT-IMPL-1 件1（CONTENT-R1 B1①）：LaTeX 记写指令映射到客户端
+    # MATHRENDER 识别闭集（math-render.js：display=\[…\]/$$…$$、inline=\(…\)，
+    # 有意排除单 $）。无论课型都适用（文科讲次也可能有符号式），故与课型
+    # 自门控并列而非置于骨架分支内。
+    "无论课型，公式一律用 LaTeX 记写：行内 \\(…\\)、独立 \\[…\\] 或 $$…$$，"
+    "禁用单个 $ 包裹（不渲染）。"
 )
 _SUMMARY_MERGE_PROMPT_TEACHING = _SUMMARY_MERGE_PROMPT + "；" + _STEM_TEACHING_RULES
+
+# ---- V010-CONTENT-IMPL-1 件3（CONTENT-R1 B3）：doc 结构化产出指令 -----------
+# 期 0 的 doc=本地组装（overview=笔记开头段落诚实子集）；本段让合并调用顺带
+# 产出结构化 doc 候选（overview/sections 带锚点要点与 LaTeX 公式），落键仍走
+# summary_contract.validate_summary_doc 同一道门、坏形状逐级丢弃+本地组装兜
+# 底（零半残）。零新调用（合并调用顺带产出）。
+_SUMMARY_DOC_RULES = (
+    "另输出doc字段：overview为2-4段总述；sections与chapters一一对应，每项含"
+    "title、start_ms（取自chapters）、source恒填semantic、points（1-8条，每条"
+    "text≤120字+anchor_ms取输入start_ms）、formulas（可空，每条latex+"
+    "anchor_ms+caption，latex不含定界符）；summary_notes为3-5条一句话小结。"
+)
+_SUMMARY_MERGE_PROMPT_DOC_TEACHING = (
+    _SUMMARY_MERGE_PROMPT_TEACHING + "；" + _SUMMARY_DOC_RULES
+)
 _SUMMARY_MERGE_PROMPT_EVIDENCE_TEACHING = (
-    _SUMMARY_MERGE_PROMPT_TEACHING + "；" + _EVIDENCE_RULES
+    _SUMMARY_MERGE_PROMPT_DOC_TEACHING + "；" + _EVIDENCE_RULES
 )
 
 
@@ -2187,6 +2211,25 @@ def create_summary(
             "start_ms": start_ms,
             "summary": summary,
         })
+    # V010-CONTENT-IMPL-1 件3（CONTENT-R1 B2 实证 0-59 失控）：章节数量纪律
+    # ——区间帽（时长//3 分钟地板与 20 帽取小、≥3 地板），超帽按时间最近邻
+    # 合并，≤帽按 start_ms 稳定排序透传（锚白名单值不丢形，幂等零新调用）。
+    duration_ms = max(
+        [0]
+        + [
+            max(int(item.get("end_ms") or 0), int(item.get("start_ms") or 0))
+            for item in transcript
+            if isinstance(item, dict)
+        ]
+        + [
+            int(item.get("created_sec") or 0) * 1000
+            for item in ppt_pages
+            if isinstance(item, dict)
+        ]
+    )
+    chapters_before_cap = len(chapters)
+    chapters = enforce_chapter_count(chapters, duration_ms)
+    chapters_cap_merged = chapters_before_cap - len(chapters)
     # N5A-P2 顺风车校验（fail-closed 丢项，不失败摘要）：events 闭集+quote
     # 必须是 parts 拼接原文子串；takeaways 截断到 6 条、每条≤60 字。
     parts_text = "".join(
@@ -2329,11 +2372,16 @@ def create_summary(
     if usage_sink is not None:
         usage_sink.extend(usage_records)
     # V010-LEARN-IMPL-P0-1 期 0 合同冻结（LEARN-D2 §4.6）：v3 加法标记 + 可选
-    # doc/chapters_v2。板块切片/doc 组装全本地零新调用（确定性切片+已过门产物
-    # 忠实组装）；任一闭集不合=None=整键省略（前端走旧态，绝不半残）——钉测
-    # 载荷（无转写/短讲次）同此降级路径。v2 既有键字段名/结构零变化。
+    # doc/chapters_v2。板块切片/doc 组装全本地零新调用（边界感知确定性切片+
+    # 已过门产物忠实组装）；任一闭集不合=None=整键省略（前端走旧态，绝不
+    # 半残）——钉测载荷（无转写/短讲次）同此降级路径。v2 既有键字段名/结构
+    # 零变化。
     chapters_v2 = build_chapters_v2(chapters, transcript)
-    doc = build_summary_doc(value["markdown"], chapters_v2, takeaways)
+    # V010-CONTENT-IMPL-1 件3（期 1 LLM 结构化增量）：合并调用顺带产出的 doc
+    # 候选逐级清洗过 validate_summary_doc 同一道门（锚白名单收敛+source 恒
+    # semantic）；全不可用=本地组装兜底——落键形状恒过门，禁半残。
+    llm_doc = coerce_llm_doc(value.get("doc"), valid_anchors)
+    doc = llm_doc or build_summary_doc(value["markdown"], chapters_v2, takeaways)
     _emit_telemetry(
         f"stage=summary windows={len(sources)}/{len(sources)} "
         f"resumed={completed} evidence_windows={len(evidence_windows)} "
@@ -2342,6 +2390,7 @@ def create_summary(
         f"takeaway_anchors={sum(1 for item in takeaway_anchors if item is not None)} "
         f"chapters={len(chapters)} chapter_anchors_derived={chapters_anchor_derived} "
         f"chapter_dup_dropped={chapters_dup_dropped} "
+        f"chapters_cap_merged={chapters_cap_merged} "
         f"knowledge_points={len(knowledge_points)} "
         f"citations_rejected={int(point_meta.get('rejected') or 0)} "
         f"thinking={deep_usage['thinking']} window_retries={window_retries} "
@@ -2351,6 +2400,7 @@ def create_summary(
         f"reasoning_tokens={deep_usage['reasoning_tokens']} "
         f"blocks={len((chapters_v2 or {}).get('items') or ())} "
         f"doc={1 if doc is not None else 0} "
+        f"doc_llm={1 if llm_doc is not None else 0} "
         f"chapters_v2={1 if chapters_v2 is not None else 0}"
     )
     result = {

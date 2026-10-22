@@ -152,8 +152,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/llm.py",
-        "sha256": "13d7a2080e8fe89b8b86d6f158cc2cd3be21a1d7911d5aba6507c2a60a8f7d4f",
-        "size": 150732
+        "sha256": "0d0eaaced1efd1d441a797b05f56aeb8746f590faf18510f2b24628ee4bef484",
+        "size": 153640
       },
       {
         "mode": "100644",
@@ -236,8 +236,8 @@
       {
         "mode": "100644",
         "path": "courselens_worker/summary_contract.py",
-        "sha256": "ff407e48662d115cb4f84e1e69dbefb3f231cbae239960991f28f51e0f90f94b",
-        "size": 16750
+        "sha256": "d4725e364dfbc6e2bcaffab9731e977c22b5500debcbfee79aa6ea98e5d60d13",
+        "size": 26494
       },
       {
         "mode": "100644",
@@ -578,8 +578,8 @@
       {
         "mode": "100644",
         "path": "tests/test_stem_teaching_prompts.py",
-        "sha256": "a7e37a146ed433b9ad573392119a000b4ef11e966ebec4434de0d5e713002ac8",
-        "size": 10855
+        "sha256": "faa0f89f2d3c53d01992868b4c5ab8acc3282ab11c9042cbaccf864938931db5",
+        "size": 13271
       },
       {
         "mode": "100644",
@@ -632,8 +632,8 @@
       {
         "mode": "100644",
         "path": "tests/test_summary_contract_v3.py",
-        "sha256": "fcd11c8c3fe3b3a48f5b91aaa61057b63cad7634d37e4ec3c6952822aa436c87",
-        "size": 14367
+        "sha256": "9567e254151f9a5380ccaa04efc0a03e39cddd7c5a3e2a7b12097cb84d1cea48",
+        "size": 26393
       },
       {
         "mode": "100644",
@@ -690,8 +690,8 @@
         "size": 10522
       }
     ],
-    "git_tree": "f0fc966e0f53e036bb41dbe006290a7bda2cf6c1",
-    "tree_sha256": "85966a8d0665a3600183ee30eeeac9b82a0b9b4e9b61126d46ba35cc716e5605"
+    "git_tree": "b1f9d000e1be6ebe8c92e4844b29582430e877a0",
+    "tree_sha256": "61479b6a62c955144d58052143c13b69188ebf86a7049192bb6e80835c4aafc1"
   },
   "protocol": {
     "supported_versions": [
@@ -700,8 +700,8 @@
   },
   "schema": "courselens.worker-mirror.manifest.v1",
   "source": {
-    "commit": "3629b2c107c556bfe85b01d2bba8d90b59dea70d",
+    "commit": "89d0320861dc7501e1427d760d6b4343e2d6249b",
     "repository": "gualtier-xu-co/Fudan-CourseLens-Private",
-    "worker_tree": "391bf681b090be7e35a382b672ab357b83a6fd80"
+    "worker_tree": "0775a40ede236870f00516337d71462d075cd34e"
   }
 }
